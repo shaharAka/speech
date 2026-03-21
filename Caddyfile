@@ -1,0 +1,35 @@
+# Caddy reverse proxy — HTTPS with self-signed cert (needed for microphone access)
+# Frontend at / — Backend API at /api/
+
+{
+    default_sni 35.239.116.25
+}
+
+https://35.239.116.25 {
+    tls /etc/caddy/certs/cert.pem /etc/caddy/certs/key.pem
+
+    # API requests → backend
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+
+    # Everything else → frontend
+    handle {
+        reverse_proxy frontend:3000
+    }
+
+    # Enable gzip
+    encode gzip
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
+
+# Redirect HTTP → HTTPS
+http://35.239.116.25 {
+    redir https://35.239.116.25{uri} permanent
+}

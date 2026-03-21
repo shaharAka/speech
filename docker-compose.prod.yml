@@ -1,0 +1,88 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+      - caddy-data:/data
+    depends_on:
+      - backend
+      - frontend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    volumes:
+      - app-storage:/app/storage
+    environment:
+      DATABASE_URL: "sqlite+aiosqlite:///./storage/whisper.db"
+      REDIS_URL: "redis://redis:6379/0"
+      MODEL_STORAGE_PATH: /app/storage/models
+      AUDIO_STORAGE_PATH: /app/storage/audio
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      HF_MODEL_ID: ivrit-ai/whisper-large-v3-turbo
+      HF_CT2_MODEL_ID: ivrit-ai/whisper-large-v3-turbo-ct2
+      CORS_ORIGINS: "*"
+      MIN_RECORDINGS_FOR_TRAINING: "50"
+      GCP_PROJECT_ID: whisper-489414
+      GCP_REGION: us-central1
+      GCP_ZONE: us-central1-a
+      GCS_BUCKET: whisper-training-whisper-489414
+      GCP_TRAINING_ENABLED: "true"
+      VERTEX_TRAINING_ENABLED: "false"
+      GCP_USE_SPOT: "false"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=1
+    restart: unless-stopped
+    volumes:
+      - app-storage:/app/storage
+    environment:
+      DATABASE_URL: "sqlite+aiosqlite:///./storage/whisper.db"
+      REDIS_URL: "redis://redis:6379/0"
+      MODEL_STORAGE_PATH: /app/storage/models
+      AUDIO_STORAGE_PATH: /app/storage/audio
+      GCP_PROJECT_ID: whisper-489414
+      GCP_REGION: us-central1
+      GCP_ZONE: us-central1-a
+      GCS_BUCKET: whisper-training-whisper-489414
+      GCP_TRAINING_ENABLED: "true"
+      VERTEX_TRAINING_ENABLED: "false"
+      GCP_USE_SPOT: "false"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+
+volumes:
+  app-storage:
+  caddy-data:

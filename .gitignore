@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+frontend/.env.local
+backend/.env
+
+# Storage (audio files, models)
+backend/storage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Next.js
+frontend/.next/
+frontend/out/
+
+# Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Docker
+docker-compose.override.yml
+
+# Alembic
+backend/alembic/versions/__pycache__/
+
+# Certificates
+certs/
+
+# Claude internal
+.claude/projects/

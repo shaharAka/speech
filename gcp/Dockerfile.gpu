@@ -1,0 +1,64 @@
+# GPU training image for Whisper Hebrew fine-tuning
+# Pre-built with ALL dependencies including ChatterboxTTS for data augmentation
+# Push to Artifact Registry so training VMs skip pip install entirely
+FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV HF_AUDIO_DECODER_BACKEND=soundfile
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    ffmpeg \
+    libsndfile1 \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 the default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+WORKDIR /app
+
+# Install core training deps (fast layer — cached if unchanged)
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 && \
+    pip install --no-cache-dir \
+    transformers \
+    peft \
+    "datasets<3.0" \
+    accelerate \
+    evaluate \
+    jiwer \
+    ctranslate2 \
+    aiosqlite \
+    pydantic \
+    pydantic-settings \
+    soundfile \
+    librosa
+
+# Install ChatterboxTTS (heavy — separate layer so core deps stay cached)
+RUN pip install --no-cache-dir chatterbox-tts
+
+# Pre-download the Whisper base model so training starts faster
+RUN python3 -c "from transformers import WhisperForConditionalGeneration, WhisperProcessor; \
+    WhisperForConditionalGeneration.from_pretrained('ivrit-ai/whisper-large-v3-turbo'); \
+    WhisperProcessor.from_pretrained('ivrit-ai/whisper-large-v3-turbo')"
+
+# Remove torchcodec if pulled in (causes issues with DL images)
+RUN pip uninstall -y torchcodec 2>/dev/null || true
+
+# Copy application code (will be overwritten by GCS at runtime, but good for testing)
+COPY backend/app/ ./app/
+COPY backend/training/ ./training/
+
+# Create storage directories
+RUN mkdir -p storage/audio storage/models /tmp/training-data /tmp/output
+
+ENTRYPOINT ["python3"]
