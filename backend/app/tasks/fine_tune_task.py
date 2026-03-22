@@ -317,32 +317,62 @@ def _run_gcp_training(self, training_run_id: int):
             self.update_state(state="PROGRESS", meta={"step": "downloading_model"})
             model_path = download_model(training_run_id)
 
-            # 6. Register model version
+            # 6. Register model version + WER gate
+            new_wer = results.get("eval_wer")
+
+            # Check current active model's WER
+            current_active = db.execute(
+                select(ModelVersion).where(ModelVersion.is_active == True)
+            ).scalar_one_or_none()
+            current_wer = current_active.eval_wer if current_active else None
+
+            # Activate only if new model is better (lower WER)
+            should_activate = False
+            if current_wer is None or new_wer is None:
+                should_activate = True  # No baseline to compare — activate by default
+                logger.info(f"[Run {training_run_id}] No WER baseline — activating new model")
+            elif new_wer < current_wer:
+                should_activate = True
+                improvement = current_wer - new_wer
+                logger.info(f"[Run {training_run_id}] WER improved: {current_wer:.4f} → {new_wer:.4f} (Δ{improvement:.4f}) — activating!")
+            else:
+                logger.warning(f"[Run {training_run_id}] WER did NOT improve: {current_wer:.4f} → {new_wer:.4f} — keeping current model")
+
             version_tag = f"v{training_run_id}"
             model_version = ModelVersion(
                 version_tag=version_tag,
                 display_name=f"Fine-tuned (run #{training_run_id}, {run.num_samples} samples, GCP)",
                 base_model_name=settings.hf_model_id,
                 model_path=model_path,
-                is_active=False,
+                is_active=False,  # Set below if passing gate
                 is_base=False,
-                eval_wer=results.get("eval_wer"),
+                eval_wer=new_wer,
+                eval_wer_improvement=(current_wer - new_wer) if current_wer and new_wer else None,
                 num_training_samples=run.num_samples,
             )
             db.add(model_version)
             db.flush()
 
+            if should_activate:
+                # Deactivate current model
+                if current_active:
+                    current_active.is_active = False
+                model_version.is_active = True
+                logger.info(f"[Run {training_run_id}] Model v{model_version.id} activated (WER: {new_wer})")
+            else:
+                logger.info(f"[Run {training_run_id}] Model v{model_version.id} saved but NOT activated (WER gate)")
+
             # Update training run
             run.status = "completed"
             run.result_model_version_id = model_version.id
-            run.eval_wer = results.get("eval_wer")
+            run.eval_wer = new_wer
             run.train_wer = results.get("train_wer")
             run.training_loss = results.get("train_loss")
-            run.error_message = None
+            run.error_message = None if should_activate else f"WER gate: {new_wer:.4f} >= current {current_wer:.4f}"
             run.completed_at = datetime.utcnow()
             db.commit()
 
-            logger.info(f"[Run {training_run_id}] Completed! Model version: {model_version.id}")
+            logger.info(f"[Run {training_run_id}] Completed! Model v{model_version.id}, active={should_activate}")
 
             # Post-training: coaching agent generates report + next round texts
             coaching_id = _post_training_coaching(self, training_run_id, db)

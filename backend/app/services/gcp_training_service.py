@@ -139,9 +139,7 @@ def create_training_vm(run_id: int) -> str:
     sa_email = f"whisper-trainer@{settings.gcp_project_id}.iam.gserviceaccount.com"
     job_dir = f"gs://{settings.gcs_bucket}/training-jobs/run_{run_id}"
 
-    training_image = f"us-central1-docker.pkg.dev/{settings.gcp_project_id}/whisper-training/trainer:latest"
-
-    # Startup script — uses pre-built Docker image (no pip install needed)
+    # Startup script — direct pip install (fast without TTS deps)
     startup_script = f"""#!/bin/bash
 set -euo pipefail
 exec > /var/log/whisper-training.log 2>&1
@@ -151,29 +149,82 @@ echo "Run ID: {run_id}"
 nvidia-smi
 echo "GPU ready!"
 
-# Download code and data from GCS
+# Download code from GCS
 mkdir -p /opt/whisper /tmp/training-data /tmp/output
 gsutil -m cp -r gs://{settings.gcs_bucket}/code/* /opt/whisper/
+cd /opt/whisper
+
+# Download training data
 gsutil -m cp -r {job_dir}/data/* /tmp/training-data/
 gsutil cp {job_dir}/manifest.json /tmp/training-data/manifest.json
 echo "Data downloaded"
 
-# Auth Docker for Artifact Registry
-gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
-docker pull {training_image}
-echo "Docker image ready"
+# Install core training dependencies (~2 min, no heavy TTS)
+pip install --quiet transformers peft "datasets<3.0" accelerate evaluate jiwer ctranslate2 aiosqlite pydantic pydantic-settings soundfile librosa 2>&1 | tail -10
+pip uninstall -y torchcodec 2>/dev/null || true
+echo "Pip done (core)"
+
+# TTS data augmentation if tts_enabled
+# Always generates fresh 500 samples using the best WER recordings as reference
+if python3 -c "import json; m=json.load(open('/tmp/training-data/manifest.json')); exit(0 if m.get('config',{{}}).get('tts_enabled') else 1)" 2>/dev/null; then
+    echo "TTS enabled — generating 500 samples using best-WER reference clips..."
+
+    # Step 1: Set up isolated venv (avoids DL VM torch conflicts)
+    python3 -m venv /tmp/tts-env
+    /tmp/tts-env/bin/pip install --quiet torch torchaudio --index-url https://download.pytorch.org/whl/cu121 2>&1 | tail -3
+    /tmp/tts-env/bin/pip install --quiet chatterbox-tts 2>&1 | tail -3
+    echo "TTS venv ready"
+
+    # Step 2: Extract TTS texts from manifest
+    python3 -c "
+import json
+m = json.load(open('/tmp/training-data/manifest.json'))
+texts = m.get('tts_texts', [])[:500]
+json.dump(texts, open('/tmp/tts_texts.json', 'w', encoding='utf-8'), ensure_ascii=False)
+print(f'TTS texts: {{len(texts)}}')
+"
+
+    # Step 3: Pick 5 reference clips — longest recordings for richest voice profile
+    # (longer clips give TTS more speech characteristics to clone from)
+    mkdir -p /tmp/tts-ref
+    python3 -c "
+import json, os, shutil
+m = json.load(open('/tmp/training-data/manifest.json'))
+samples = m['samples']
+# Sort by file size descending — longest recordings have most voice data
+samples = sorted(samples, key=lambda s: os.path.getsize(os.path.join('/tmp/training-data', s['audio_file'])), reverse=True)
+for s in samples[:5]:
+    src = os.path.join('/tmp/training-data', s['audio_file'])
+    if os.path.exists(src):
+        shutil.copy2(src, '/tmp/tts-ref/')
+        sz = os.path.getsize(src) / 1024
+        print(f'  {{s[\"audio_file\"]}}: {{sz:.0f}}KB')
+print(f'Selected {{min(5, len(samples))}} longest clips as reference')
+"
+
+    # Step 4: Generate TTS samples
+    mkdir -p /tmp/training-data/tts
+    /tmp/tts-env/bin/python /opt/whisper/scripts/run_tts_generation.py \
+        --reference-dir /tmp/tts-ref \
+        --output-dir /tmp/training-data/tts \
+        --texts-json /tmp/tts_texts.json 2>&1 | tail -20
+
+    # Step 5: Verify and clean up
+    TTS_COUNT=$(ls /tmp/training-data/tts/tts_*.wav 2>/dev/null | wc -l)
+    echo "TTS generated: $TTS_COUNT samples"
+    if [ "$TTS_COUNT" -lt 10 ]; then
+        echo "TTS FAILED — only $TTS_COUNT samples. Aborting."
+        exit 1
+    fi
+
+    rm -rf /tmp/tts-env /tmp/tts-ref
+    echo "TTS venv cleaned up — GPU memory freed for training"
+fi
+
+export PYTHONPATH=/opt/whisper:${{PYTHONPATH:-}}
+export HF_AUDIO_DECODER_BACKEND=soundfile
 
 echo "=== Starting Training ==="
-# Run training inside pre-built container (all deps pre-installed, zero pip time)
-docker run --rm --gpus all \
-    -v /opt/whisper:/app:ro \
-    -v /tmp/training-data:/tmp/training-data \
-    -v /tmp/output:/tmp/output \
-    -e PYTHONPATH=/app \
-    -e HF_AUDIO_DECODER_BACKEND=soundfile \
-    {training_image} \
-    python3 -c "
-
 python3 -c "
 import json, os, sys, logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -186,44 +237,69 @@ config = manifest['config']
 samples = manifest['samples']
 logger.info(f'Samples: {{len(samples)}}')
 
-# === Phase 0: TTS Data Augmentation ===
-tts_texts = manifest.get('tts_texts', [])
-if tts_texts and config.get('tts_enabled', False):
-    logger.info(f'Starting TTS augmentation with {{len(tts_texts)}} texts...')
-    try:
-        from training.tts_augmentation import run_tts_augmentation
-        manifest = run_tts_augmentation(manifest, '/tmp/training-data', tts_texts, config)
-        samples = manifest['samples']
-        logger.info(f'After TTS: {{len(samples)}} total samples')
-    except Exception as e:
-        logger.error(f'TTS augmentation failed: {{e}}')
-        import traceback; traceback.print_exc()
-        # Continue with real data only
+# === Phase 0: Load Pre-Generated TTS Data ===
+if config.get('tts_enabled', False):
+    tts_dir = '/tmp/training-data/tts'
+    tts_manifest_path = os.path.join(tts_dir, 'tts_manifest.json')
+    if os.path.exists(tts_manifest_path):
+        with open(tts_manifest_path, encoding='utf-8') as tf:
+            tts_data = json.load(tf)
+        tts_samples = tts_data.get('samples', [])
+        # Update paths to point to tts subdirectory
+        for s in tts_samples:
+            s['audio_file'] = os.path.join('tts', s['audio_file'])
+        samples.extend(tts_samples)
+        logger.info(f'Loaded {{len(tts_samples)}} pre-generated TTS samples (total: {{len(samples)}})')
+    else:
+        logger.error('TTS enabled but no pre-generated data found at ' + tts_manifest_path)
+        sys.exit(1)
 
 # === Phase 1: Build Dataset ===
-# Tag real samples and apply oversampling for balance
+# CRITICAL: Split REAL data first, then augment only the training portion.
+# This prevents synthetic (TTS) samples from leaking into the eval set.
 real_samples = [s for s in samples if s.get('source', 'real') == 'real']
 synth_samples = [s for s in samples if s.get('source') == 'synthetic']
-weight = config.get('real_sample_weight', 8)
-if synth_samples and weight > 1:
-    balanced = real_samples * int(weight) + synth_samples
-    logger.info(f'Balanced: {{len(real_samples)}}x{{int(weight)}} real + {{len(synth_samples)}} synth = {{len(balanced)}}')
-else:
-    balanced = samples
 
 from datasets import Dataset, Audio
-audio_paths = [os.path.join('/tmp/training-data', s['audio_file']) for s in balanced]
-sentences = [s['sentence'] for s in balanced]
-existing = [(a, s) for a, s in zip(audio_paths, sentences) if os.path.exists(a)]
-logger.info(f'Valid: {{len(existing)}}/{{len(audio_paths)}}')
 
-if len(existing) < 10:
+# Step 1a: Build real-only dataset and split
+real_audio = [os.path.join('/tmp/training-data', s['audio_file']) for s in real_samples]
+real_sents = [s['sentence'] for s in real_samples]
+real_existing = [(a, s) for a, s in zip(real_audio, real_sents) if os.path.exists(a)]
+logger.info(f'Real samples: {{len(real_existing)}}')
+
+if len(real_existing) < 10:
+    logger.error(f'Not enough real samples: {{len(real_existing)}}')
     sys.exit(1)
 
-audio_paths, sentences = zip(*existing)
-dataset = Dataset.from_dict({{'audio': list(audio_paths), 'sentence': list(sentences)}})
-dataset = dataset.cast_column('audio', Audio(sampling_rate=16000))
-split = dataset.train_test_split(test_size=0.1, seed=42)
+r_audio, r_sents = zip(*real_existing)
+real_ds = Dataset.from_dict({{'audio': list(r_audio), 'sentence': list(r_sents)}})
+real_ds = real_ds.cast_column('audio', Audio(sampling_rate=16000))
+real_split = real_ds.train_test_split(test_size=0.1, seed=42)
+logger.info(f'Real split: {{len(real_split[\"train\"])}} train / {{len(real_split[\"test\"])}} eval (REAL ONLY)')
+
+# Step 1b: Build training set = oversampled real train + synthetic
+weight = config.get('real_sample_weight', 8)
+if synth_samples:
+    synth_audio = [os.path.join('/tmp/training-data', s['audio_file']) for s in synth_samples]
+    synth_sents = [s['sentence'] for s in synth_samples]
+    synth_existing = [(a, s) for a, s in zip(synth_audio, synth_sents) if os.path.exists(a)]
+    logger.info(f'Synthetic samples: {{len(synth_existing)}}')
+    s_audio, s_sents = zip(*synth_existing)
+    synth_ds = Dataset.from_dict({{'audio': list(s_audio), 'sentence': list(s_sents)}})
+    synth_ds = synth_ds.cast_column('audio', Audio(sampling_rate=16000))
+
+    # Oversample real train data to balance with synthetic
+    from datasets import concatenate_datasets
+    real_train_repeated = concatenate_datasets([real_split['train']] * int(weight))
+    train_ds = concatenate_datasets([real_train_repeated, synth_ds])
+    logger.info(f'Training set: {{len(real_split[\"train\"])}}x{{weight}} real + {{len(synth_ds)}} synth = {{len(train_ds)}} total')
+else:
+    train_ds = real_split['train']
+    logger.info(f'Training set: {{len(train_ds)}} real (no TTS)')
+
+# Eval is ALWAYS real-only — no synthetic contamination
+eval_ds = real_split['test']
 
 # === Phase 2: Training ===
 from training.trainer import run_training
@@ -232,8 +308,8 @@ os.makedirs(output_dir, exist_ok=True)
 os.chmod(output_dir, 0o777)
 
 result = run_training(
-    train_dataset=split['train'],
-    eval_dataset=split['test'],
+    train_dataset=train_ds,
+    eval_dataset=eval_ds,
     output_dir=output_dir,
     config={{
         'num_train_epochs': config.get('num_epochs', 5),
